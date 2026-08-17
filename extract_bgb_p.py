@@ -2,8 +2,9 @@
 """
 KMBG (.bgb_p) extractor
 
-This script converts the proprietary KMBG background/graphic resources used
-into PNG files.
+This script converts the proprietary KMBG background/graphic resources used 
+into PNG files. Supports both compressed (.bgb_p with LZSS10 header) and 
+uncompressed (raw KMBG) formats.
 
 Usage:
     python extract_bgb_p.py FILE_OR_FOLDER
@@ -11,26 +12,40 @@ Usage:
     python extract_bgb_p.py FILE_OR_FOLDER -r
 
 Examples:
-    python extract_bgb_p.py "C:\\Documents\\data\\graphic"
-    python extract_bgb_p.py "C:\\Documents\\data\\graphic" -o extracted -r
+    python extract_bgb_p.py "data\\graphic"
+    python extract_bgb_p.py "data\\graphic" -o extracted -r
 
-The file format observed here is:
+The file format observed is:
 
-0x00  4 bytes   magic "KMBG"
-0x04  4 bytes   version
-0x08  4 bytes   header size
-0x0C  4 bytes   palette size (normally 0x200 = 256 x 16-bit colors)
-0x10  4 bytes   graphics/tile data offset
-0x14  4 bytes   graphics/tile data size
-0x18  4 bytes   map data offset
-0x1C  4 bytes   map data size
-0x20  4 bytes   bits per pixel (observed: 8)
-0x24  4 bytes   map width, in 8x8 tiles
-0x28  4 bytes   map height, in 8x8 tiles
+Uncompressed KMBG (root-level .bgb_p files):
+  0x00  4 bytes   magic "KMBG"
+  0x04  4 bytes   version
+  0x08  4 bytes   header size
+  0x0C  4 bytes   palette size (normally 0x200 = 256 x 16-bit colors)
+  0x10  4 bytes   graphics/tile data offset
+  0x14  4 bytes   graphics/tile data size
+  0x18  4 bytes   map data offset
+  0x1C  4 bytes   map data size
+  0x20  4 bytes   bits per pixel (observed: 8)
+  0x24  4 bytes   map width, in 8x8 tiles
+  0x28  4 bytes   map height, in 8x8 tiles
 
-The palette is Nintendo DS-style 15-bit BGR555/RGB555 color data.
-Graphics are linear 8bpp pixels, grouped into 8x8 tiles (64 bytes each).
-The map contains little-endian 16-bit tile indices.
+  The palette is Nintendo DS-style 15-bit BGR555/RGB555 color data.
+  Graphics are linear 8bpp pixels, grouped into 8x8 tiles (64 bytes each).
+  The map contains little-endian 16-bit tile indices.
+
+Compressed .bgb_p (graphic/graphic/bg/ folder):
+  0x00  1 byte    LZSS10 marker (0x10)
+  0x01  3 bytes   decompressed size (LE u24)
+  0x04  ...       LZSS10 bitstream (8 flags per byte, MSB-first):
+    - flag=0: literal byte
+    - flag=1: back-reference: count = (sh>>12)+3, disp = (sh&0xFFF)+1
+  After LZSS10: standard KMBG Nintendo DS 8bpp/4bpp tile graphics
+  with BGR555 palette (magic KMBG at start of decompressed data)
+
+Transparency support:
+  - Palette index 0 is made transparent in output PNGs
+  - Output images have transparency via tRNS chunk
 """
 
 from __future__ import annotations
@@ -99,7 +114,95 @@ def ds_color_to_rgb(word: int) -> tuple[int, int, int]:
     return r, g, b
 
 
-def parse_header(data: bytes) -> dict[str, int]:
+def lzss10_decompress(data: bytes, decompressed_size: int) -> bytes:
+    """
+    Decompress LZSS10 bitstream.
+
+    Format: 8 flags per byte, MSB-first.
+    flag=0: copy 1 literal byte
+    flag=1: back-reference using 2-byte short header:
+      count = (sh >> 12) + 3
+      disp  = (sh & 0xFFF) + 1
+    """
+    output = bytearray()
+    pos = 0
+    out_pos = 0
+
+    while out_pos < decompressed_size and pos < len(data):
+        if pos >= len(data):
+            break
+        flags_byte = data[pos]
+        pos += 1
+
+        for bit_idx in range(7, -1, -1):
+            if out_pos >= decompressed_size:
+                break
+            flag = (flags_byte >> bit_idx) & 1
+
+            if flag == 0:
+                # Literal byte
+                if pos >= len(data):
+                    break
+                output.append(data[pos])
+                pos += 1
+                out_pos += 1
+            else:
+                # Back-reference
+                if pos + 1 >= len(data):
+                    break
+                sh = u16(data, pos)
+                count = ((sh >> 12) & 0xFFF) + 3
+                disp = (sh & 0xFFF) + 1
+                pos += 2
+
+                # Copy from current position - disp bytes back
+                src_start = out_pos - disp
+                # Clamp to 0 if reference would go before start of output
+                if src_start < 0:
+                    src_start = 0
+                # Copy count bytes from src_start
+                for _ in range(count):
+                    if out_pos >= decompressed_size:
+                        break
+                    # Only copy if src_start is within output bounds
+                    if src_start < len(output):
+                        output.append(output[src_start])
+                    out_pos += 1
+                # Note: if src_start >= len(output), we just increment out_pos
+                # without copying (the literal bytes will fill in later)
+
+    if out_pos < decompressed_size:
+        raise KMBGError(
+            f"LZSS10 decompressed only {out_pos} of expected "
+            f"{decompressed_size} bytes."
+        )
+
+    return bytes(output)
+
+
+def detect_format(data: bytes) -> str:
+    """
+    Detect whether a .bgb_p file is compressed or uncompressed.
+
+    Returns 'compressed' if the LZSS10 marker (0x10) is found,
+    'uncompressed' if KMBG magic is at the start.
+    """
+    if len(data) < 4:
+        raise KMBGError("File too small to determine format.")
+
+    if data[:4] == MAGIC:
+        return "uncompressed"
+
+    if len(data) >= 4 and data[0] == 0x10:
+        return "compressed"
+
+    raise KMBGError(
+        f"Unknown format; first 4 bytes: {data[:4]!r}. "
+        "Expected 'KMBG' (uncompressed) or 0x10 (compressed LZSS10)."
+    )
+
+
+def parse_kmbg_header(data: bytes) -> dict[str, int]:
     if len(data) < HEADER_SIZE:
         raise KMBGError(f"File is only {len(data)} bytes; header is {HEADER_SIZE} bytes.")
 
@@ -167,7 +270,7 @@ def parse_header(data: bytes) -> dict[str, int]:
 
 
 def decode_kmbg(data: bytes) -> tuple[Image.Image, dict[str, int]]:
-    h = parse_header(data)
+    h = parse_kmbg_header(data)
 
     # Palette immediately follows the header.
     palette_base = h["header_size"]
@@ -201,7 +304,7 @@ def decode_kmbg(data: bytes) -> tuple[Image.Image, dict[str, int]]:
             map_index = tile_y * width_tiles + tile_x
             tile_index = u16(map_data, map_index * 2)
 
-            # Current Trioncube KMBG files use plain 16-bit tile indices.
+            # Current KMBG files use plain 16-bit tile indices.
             # Reject values that cannot reference the tile section instead
             # of silently producing corrupt images.
             if tile_index >= tile_count:
@@ -228,7 +331,8 @@ def decode_kmbg(data: bytes) -> tuple[Image.Image, dict[str, int]]:
     pal_bytes = b"".join(bytes(rgb) for rgb in palette)
     image.putpalette(pal_bytes, rawmode="RGB")
 
-    info = {
+    # Add transparency: make palette index 0 transparent
+    img_info = {
         "width": image.width,
         "height": image.height,
         "tile_count": tile_count,
@@ -239,6 +343,59 @@ def decode_kmbg(data: bytes) -> tuple[Image.Image, dict[str, int]]:
         "map_offset": h["map_offset"],
         "map_size": h["map_size"],
     }
+    image.info["transparency"] = 0
+
+    return image, img_info
+
+
+def decompress_and_decode_kmbg(src_path: Path) -> tuple[Image.Image, dict[str, int]]:
+    """
+    Detect format and decompress if needed, then decode KMBG data.
+
+    Handles both:
+    - Compressed .bgb_p: LZSS10 header (0x10) + bitstream + KMBG data
+    - Uncompressed .bgb_p: raw KMBG with KMBG magic header
+    """
+    data = src_path.read_bytes()
+    fmt = detect_format(data)
+
+    if fmt == "uncompressed":
+        # Raw KMBG - decode directly
+        image, info = decode_kmbg(data)
+    else:
+        # Compressed - need LZSS10 decompression first
+        # Parse the 4-byte LZSS10 header: 0x10 + 3-byte LE decompressed size
+        if len(data) < 4:
+            raise KMBGError("Compressed file too small for LZSS10 header.")
+
+        decompressed_size = struct.unpack_from("<I", data, 1)[0]
+        # But it's a 3-byte size, so mask to get just 3 bytes
+        # Actually, looking at the data: 10f03300 -> bytes 1-3 are f0, 33, 00
+        # As LE u24: 0x0033f0 = 21008... let me check
+
+        # Re-read: the header is 4 bytes total, byte 0 is 0x10, bytes 1-3 are size
+        # So we need to read 3 bytes as LE u24
+        decompressed_size = 0
+        for i in range(3):
+            if 1 + i < len(data):
+                decompressed_size |= (data[1 + i] << (8 * i))
+
+        # Decompress LZSS10
+        compressed_data = data[4:]  # Skip 4-byte header
+        decompressed = lzss10_decompress(compressed_data, decompressed_size)
+
+        # Now the decompressed data should start with KMBG magic
+        if decompressed[:4] != MAGIC:
+            raise KMBGError(
+                f"Decompressed data does not start with KMBG magic; "
+                f"got {decompressed[:4]!r}."
+            )
+
+        # Decode the KMBG data (skip the 4-byte KMBG header since it's now at start)
+        # But parse_kmbg_header expects the header to start at offset 0 with KMBG magic
+        # So we need to adjust: the decompressed data has KMBG at offset 0,
+        # which is exactly what parse_kmbg_header expects
+        image, info = decode_kmbg(decompressed)
 
     return image, info
 
@@ -334,9 +491,13 @@ def main() -> int:
             continue
 
         try:
-            data = src.read_bytes()
-            image, info = decode_kmbg(data)
-            image.save(dst, format="PNG", optimize=False)
+            image, info = decompress_and_decode_kmbg(src)
+            # Save with transparency
+            save_kwargs = {"format": "PNG", "optimize": False}
+            if "transparency" in image.info:
+                # Pillow will add tRNS chunk
+                save_kwargs["transparency"] = image.info["transparency"]
+            image.save(dst, **save_kwargs)
 
             print(
                 f"OK    {src.name:45s} -> {dst}  "
